@@ -1,0 +1,199 @@
+// Top-level Single-Cycle RV33I Processor
+module riscv_top (
+    input  wire        clk,
+    input  wire        rst,
+    output wire [31:0] pc_out,
+    output wire [31:0] alu_out
+);
+    reg  [31:0] pc;
+    wire [31:0] instr, pc_next, pc_plus4, pc_branch;
+    wire [31:0] rd1, rd2, imm_ext, alu_in2, alu_result, read_data, wb_data;
+    wire        reg_write, mem_write, alu_src, mem_to_reg, branch, zero;
+    wire [2:0]  alu_ctrl;
+
+    // 1. Program Counter (PC)
+    assign pc_plus4  = pc + 32'd4;
+    assign pc_branch = pc + imm_ext;
+    assign pc_next   = (branch & zero) ? pc_branch : pc_plus4;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) pc <= 32'd0;
+        else     pc <= pc_next;
+    end
+
+    assign pc_out  = pc;
+    assign alu_out = alu_result;
+
+    // 2. Instruction Memory (Preloaded Test Program)
+    imem u_imem (.addr(pc), .instr(instr));
+
+    // 3. Control Unit
+    control u_ctrl (
+        .opcode    (instr[6:0]),
+        .funct3    (instr[14:12]),
+        .funct7_5  (instr[30]),
+        .reg_write (reg_write),
+        .mem_write (mem_write),
+        .alu_src   (alu_src),
+        .mem_to_reg(mem_to_reg),
+        .branch    (branch),
+        .alu_ctrl  (alu_ctrl)
+    );
+
+    // 4. Register File
+    regfile u_rf (
+        .clk (clk),
+        .we  (reg_write),
+        .rs1 (instr[19:15]),
+        .rs2 (instr[24:20]),
+        .rd  (instr[11:7]),
+        .wd  (wb_data),
+        .rd1 (rd1),
+        .rd2 (rd2)
+    );
+
+    // 5. Immediate Generator
+    imm_gen u_imm (.instr(instr), .imm_ext(imm_ext));
+
+    // 6. ALU
+    assign alu_in2 = alu_src ? imm_ext : rd2;
+    alu u_alu (
+        .a      (rd1),
+        .b      (alu_in2),
+        .ctrl   (alu_ctrl),
+        .result (alu_result),
+        .zero   (zero)
+    );
+
+    // 7. Data Memory
+    dmem u_dmem (
+        .clk (clk),
+        .we  (mem_write),
+        .addr(alu_result),
+        .wd  (rd2),
+        .rd  (read_data)
+    );
+
+    // 8. Write-Back MUX
+    assign wb_data = mem_to_reg ? read_data : alu_result;
+endmodule
+
+// --- Instruction Memory ---
+module imem (input [31:0] addr, output [31:0] instr);
+    reg [31:0] mem [0:15];
+    initial begin
+        mem[0] = 32'h00500093; // ADDI x1, x0, 5      -> x1 = 5
+        mem[1] = 32'h00A00113; // ADDI x2, x0, 10     -> x2 = 10
+        mem[2] = 32'h002081B3; // ADD  x3, x1, x2     -> x3 = 15
+        mem[3] = 32'h40110233; // SUB  x4, x2, x1     -> x4 = 5
+        mem[4] = 32'h00302023; // SW   x3, 0(x0)      -> dmem[0] = 15
+        mem[5] = 32'h00002283; // LW   x5, 0(x0)      -> x5 = 15
+        mem[6] = 32'h00000013; // NOP (ADDI x0, x0, 0)
+    end
+    assign instr = mem[addr[5:2]];
+endmodule
+
+// --- Register File ---
+module regfile (
+    input         clk, we,
+    input  [4:0]  rs1, rs2, rd,
+    input  [31:0] wd,
+    output [31:0] rd1, rd2
+);
+    reg [31:0] regs [0:31];
+    integer i;
+    initial for (i = 0; i < 32; i = i + 1) regs[i] = 32'd0;
+
+    assign rd1 = (rs1 == 5'd0) ? 32'd0 : regs[rs1];
+    assign rd2 = (rs2 == 5'd0) ? 32'd0 : regs[rs2];
+
+    always @(posedge clk) begin
+        if (we && (rd != 5'd0))
+            regs[rd] <= wd;
+    end
+endmodule
+
+// --- Immediate Generator ---
+module imm_gen (input [31:0] instr, output reg [31:0] imm_ext);
+    always @(*) begin
+        case (instr[6:0])
+            7'b0010011, 7'b0000011: // I-type (ADDI, LW)
+                imm_ext = {{20{instr[31]}}, instr[31:20]};
+            7'b0100011:             // S-type (SW)
+                imm_ext = {{20{instr[31]}}, instr[31:25], instr[11:7]};
+            7'b1100011:             // B-type (BEQ)
+                imm_ext = {{19{instr[31]}}, instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
+            default:
+                imm_ext = 32'd0;
+        endcase
+    end
+endmodule
+
+// --- Control Unit ---
+module control (
+    input  [6:0] opcode,
+    input  [2:0] funct3,
+    input        funct7_5,
+    output reg   reg_write, mem_write, alu_src, mem_to_reg, branch,
+    output reg [2:0] alu_ctrl
+);
+    always @(*) begin
+        reg_write = 0; mem_write = 0; alu_src = 0;
+        mem_to_reg = 0; branch = 0; alu_ctrl = 3'b000;
+
+        case (opcode)
+            7'b0110011: begin // R-type (ADD, SUB, AND, OR)
+                reg_write = 1;
+                case (funct3)
+                    3'b000: alu_ctrl = funct7_5 ? 3'b001 : 3'b000; // SUB : ADD
+                    3'b111: alu_ctrl = 3'b010;                     // AND
+                    3'b110: alu_ctrl = 3'b011;                     // OR
+                endcase
+            end
+            7'b0010011: begin // I-type (ADDI)
+                reg_write = 1; alu_src = 1; alu_ctrl = 3'b000;
+            end
+            7'b0000011: begin // LW
+                reg_write = 1; alu_src = 1; mem_to_reg = 1; alu_ctrl = 3'b000;
+            end
+            7'b0100011: begin // SW
+                mem_write = 1; alu_src = 1; alu_ctrl = 3'b000;
+            end
+            7'b1100011: begin // BEQ
+                branch = 1; alu_ctrl = 3'b001; // SUB to check zero
+            end
+        endcase
+    end
+endmodule
+
+// --- ALU ---
+module alu (
+    input  [31:0] a, b,
+    input  [2:0]  ctrl,
+    output reg [31:0] result,
+    output wire   zero
+);
+    always @(*) begin
+        case (ctrl)
+            3'b000: result = a + b;
+            3'b001: result = a - b;
+            3'b010: result = a & b;
+            3'b011: result = a | b;
+            default: result = 32'd0;
+        endcase
+    end
+    assign zero = (result == 32'd0);
+endmodule
+
+// --- Data Memory ---
+module dmem (
+    input         clk, we,
+    input  [31:0] addr, wd,
+    output [31:0] rd
+);
+    reg [31:0] ram [0:63];
+    assign rd = ram[addr[7:2]];
+    always @(posedge clk) begin
+        if (we) ram[addr[7:2]] <= wd;
+    end
+endmodule 

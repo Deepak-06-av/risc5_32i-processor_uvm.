@@ -1,0 +1,161 @@
+`include "uvm_macros.svh"
+import uvm_pkg::*;
+
+interface rv_if(input logic clk);
+  logic        rst;
+  logic [31:0] pc_out, alu_out;
+endinterface
+
+class rv_item extends uvm_sequence_item;
+  logic [31:0] pc, alu;
+  `uvm_object_utils(rv_item)
+  function new(string name="rv_item"); super.new(name); endfunction
+endclass
+
+// Driver: applies reset
+class rv_driver extends uvm_component;
+  `uvm_component_utils(rv_driver)
+  virtual rv_if vif;
+  function new(string name, uvm_component parent); super.new(name,parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if(!uvm_config_db#(virtual rv_if)::get(this,"","vif",vif))
+      `uvm_fatal("DRV","no vif")
+  endfunction
+  virtual task run_phase(uvm_phase phase);
+    vif.rst = 1;
+    repeat(2) @(posedge vif.clk);
+    @(negedge vif.clk);
+    vif.rst = 0;
+  endtask
+endclass
+
+// Monitor: samples pc/alu_out every cycle (negedge = stable values)
+class rv_monitor extends uvm_monitor;
+  `uvm_component_utils(rv_monitor)
+  virtual rv_if vif;
+  uvm_analysis_port #(rv_item) ap;
+  function new(string name, uvm_component parent); super.new(name,parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    ap = new("ap", this);
+    if(!uvm_config_db#(virtual rv_if)::get(this,"","vif",vif))
+      `uvm_fatal("MON","no vif")
+  endfunction
+  virtual task run_phase(uvm_phase phase);
+    rv_item t;
+    forever begin
+      @(negedge vif.clk);
+      if (vif.rst === 1'b0) begin
+        t = rv_item::type_id::create("t");
+        t.pc  = vif.pc_out;
+        t.alu = vif.alu_out;
+        ap.write(t);
+      end
+    end
+  endtask
+endclass
+
+// Scoreboard: golden ALU result per instruction + final register check
+class rv_scoreboard extends uvm_scoreboard;
+  `uvm_component_utils(rv_scoreboard)
+  uvm_analysis_imp #(rv_item, rv_scoreboard) imp;
+  logic [31:0] exp_alu [7] = '{5, 10, 15, 5, 0, 0, 0};
+  int pass_cnt, fail_cnt;
+  function new(string name, uvm_component parent); super.new(name,parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    imp = new("imp", this);
+  endfunction
+
+  function void write(rv_item t);
+    if (!$isunknown(t.pc) && t.pc < 28 && t.pc[1:0] == 0) begin
+      if (t.alu === exp_alu[t.pc[4:2]]) begin
+        pass_cnt++;
+        `uvm_info("SB", $sformatf("PASS pc=%0d alu_out=%0d", t.pc, t.alu), UVM_LOW)
+      end else begin
+        fail_cnt++;
+        `uvm_error("SB", $sformatf("FAIL pc=%0d alu_out=%0d expected=%0d",
+                                   t.pc, t.alu, exp_alu[t.pc[4:2]]))
+      end
+    end
+  endfunction
+
+  function void chk(string n, logic [31:0] got, logic [31:0] exp);
+    if (got === exp) begin
+      pass_cnt++;
+      `uvm_info("SB", $sformatf("PASS %s = %0d", n, got), UVM_LOW)
+    end else begin
+      fail_cnt++;
+      `uvm_error("SB", $sformatf("FAIL %s = %0d expected %0d", n, got, exp))
+    end
+  endfunction
+
+  virtual function void check_phase(uvm_phase phase);
+    chk("x1", tb_top.dut.u_rf.regs[1], 5);
+    chk("x2", tb_top.dut.u_rf.regs[2], 10);
+    chk("x3", tb_top.dut.u_rf.regs[3], 15);
+    chk("x4", tb_top.dut.u_rf.regs[4], 5);
+    chk("x5", tb_top.dut.u_rf.regs[5], 15);
+  endfunction
+
+  virtual function void report_phase(uvm_phase phase);
+    `uvm_info("SB", $sformatf("RESULT: %0d passed, %0d failed", pass_cnt, fail_cnt), UVM_NONE)
+  endfunction
+endclass
+
+class rv_env extends uvm_env;
+  `uvm_component_utils(rv_env)
+  rv_driver     drv;
+  rv_monitor    mon;
+  rv_scoreboard sb;
+  function new(string name, uvm_component parent); super.new(name,parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    drv = rv_driver::type_id::create("drv", this);
+    mon = rv_monitor::type_id::create("mon", this);
+    sb  = rv_scoreboard::type_id::create("sb", this);
+  endfunction
+  virtual function void connect_phase(uvm_phase phase);
+    mon.ap.connect(sb.imp);
+  endfunction
+endclass
+
+class rv_test extends uvm_test;
+  `uvm_component_utils(rv_test)
+  rv_env env;
+  virtual rv_if vif;
+  function new(string name, uvm_component parent); super.new(name,parent); endfunction
+  virtual function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    env = rv_env::type_id::create("env", this);
+    if(!uvm_config_db#(virtual rv_if)::get(this,"","vif",vif))
+      `uvm_fatal("TEST","no vif")
+  endfunction
+  virtual task run_phase(uvm_phase phase);
+    phase.raise_objection(this);
+    repeat(10) @(posedge vif.clk);   // reset + 7 instructions
+    phase.drop_objection(this);
+  endtask
+endclass
+
+module tb_top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+
+  rv_if vif(clk);
+
+  riscv_top dut (
+    .clk    (clk),
+    .rst    (vif.rst),
+    .pc_out (vif.pc_out),
+    .alu_out(vif.alu_out)
+  );
+
+  initial begin
+    $dumpfile("dump.vcd");
+    $dumpvars(0, tb_top);
+    uvm_config_db#(virtual rv_if)::set(null, "*", "vif", vif);
+    run_test("rv_test");
+  end
+endmodule 
